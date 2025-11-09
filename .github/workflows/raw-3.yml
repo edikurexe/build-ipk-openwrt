@@ -1,0 +1,185 @@
+name: Build OpenWrt IPKs (Latest Release, x86 & arm64, External GitHub Source → GitHub Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo_url:
+        description: "URL repo GitHub yang berisi package (contoh: https://github.com/username/repo)"
+        required: true
+        type: string
+      branch:
+        description: "Branch sumber package"
+        required: false
+        default: "main"
+        type: string
+      subdir:
+        description: "Subdirektori dalam repo sumber (kosongkan jika tidak ada)"
+        required: false
+        default: ""
+        type: string
+      package_name:
+        description: "Nama package (folder) yang akan dikompilasi (sesuai nama folder di package/<nama>)"
+        required: true
+        type: string
+      make_flags:
+        description: "Tambahan flag untuk make (opsional)"
+        required: false
+        default: ""
+        type: string
+      release_tag:
+        description: "Tag rilis GitHub (biarkan kosong untuk pakai ipks-<run_id>)"
+        required: false
+        default: ""
+        type: string
+      release_name:
+        description: "Nama rilis GitHub (biarkan kosong untuk pakai OpenWrt IPKs <run_number>)"
+        required: false
+        default: ""
+        type: string
+      draft:
+        description: "Buat rilis sebagai draft?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      prerelease:
+        description: "Tandai rilis sebagai pre-release?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for ${{ matrix.profile.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - { name: "x86-64", target: "x86", subtarget: "64" }
+          - { name: "armvirt-64", target: "armvirt", subtarget: "64" }
+
+    steps:
+      - name: Checkout (empty workspace)
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu 22.04/24.04 compatible)
+        shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib             gettext git libncurses5-dev libssl-dev python3 python3-venv             rsync unzip zlib1g-dev file wget curl ccache xz-utils ca-certificates
+          # NOTE: python3-distutils tidak ada di 24.04; tidak diperlukan untuk build SDK, jadi di-skip.
+          # Jika workflow lama butuh, pasang kondisional (tidak error kalau tak tersedia):
+          if apt-cache show python3-distutils >/dev/null 2>&1; then
+            sudo apt-get install -y python3-distutils || true
+          fi
+
+      - name: Cache OpenWrt dl directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.openwrt-dl
+          key: dl-${{ runner.os }}-${{ hashFiles('**/feeds.conf', '**/package/**', '**/*.mk') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Detect latest stable OpenWrt release
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://downloads.openwrt.org/releases"
+          latest="$(curl -fsSL "$base/" | grep -Po '(?<=href=")[0-9]+\.[0-9]+(\.[0-9]+)?(?=/")' | sort -V | tail -n1)"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Latest stable: $latest"
+
+      - name: Download and extract SDK
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.detect.outputs.latest }}"
+          tgt="${{ matrix.profile.target }}"
+          sub="${{ matrix.profile.subtarget }}"
+          echo "Resolving SDK for ${tgt}/${sub} version ${ver}"
+          url="$(curl -fsSL "https://downloads.openwrt.org/releases/${ver}/targets/${tgt}/${sub}/"             | grep -Eo 'href="openwrt-sdk-[^"]+\.tar\.xz"'             | cut -d'"' -f2             | head -n1)"
+          if [[ -z "$url" ]]; then
+            echo "SDK not found for ${tgt}/${sub}"; exit 1
+          fi
+          full="https://downloads.openwrt.org/releases/${ver}/targets/${tgt}/${sub}/${url}"
+          echo "Downloading $full"
+          curl -fL "$full" -o sdk.tar.xz
+          tar -xf sdk.tar.xz
+          sdk_dir="$(tar -tf sdk.tar.xz | head -n1 | cut -d/ -f1)"
+          echo "sdk_dir=$sdk_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare feeds
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Bring external package
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          src_url="${{ inputs.source_repo_url }}"
+          branch="${{ inputs.branch }}"
+          subdir="${{ inputs.subdir }}"
+          pkg="${{ inputs.package_name }}"
+          tmpdir="$(mktemp -d)"
+          git clone --depth=1 -b "$branch" "$src_url" "$tmpdir/src"
+          if [[ -n "$subdir" ]]; then
+            srcpath="$tmpdir/src/$subdir"
+          else
+            srcpath="$tmpdir/src"
+          fi
+          test -d "package/$pkg" || mkdir -p "package/$pkg"
+          rsync -a --delete "$srcpath/" "package/$pkg/"
+
+      - name: Build package
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make defconfig
+          # Compile only the selected package
+          make package/${{ inputs.package_name }}/compile ${{ inputs.make_flags }} -j"$(nproc)" V=s ||           make package/${{ inputs.package_name }}/compile V=s -j1
+
+      - name: Collect IPKs
+        id: collect
+        working-directory: ${{ steps.sdk.outputs.sdk_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/release/${{ matrix.profile.name }}"
+          mkdir -p "$out"
+          find bin/packages -type f -name "*.ipk" -exec cp -v {} "$out"/ \;
+          (cd "$out" && sha256sum *.ipk > SHA256SUMS || true)
+          echo "out_dir=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipks-${{ matrix.profile.name }}
+          path: ${{ steps.collect.outputs.out_dir }}
+
+      - name: Create GitHub Release
+        if: ${{ matrix.profile.name == 'x86-64' }}  # create once
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('ipks-{0}', github.run_id) }}
+          name: ${{ inputs.release_name != '' && inputs.release_name || format('OpenWrt IPKs {0}', github.run_number) }}
+          draft: ${{ inputs.draft == 'true' }}
+          prerelease: ${{ inputs.prerelease == 'true' }}
+          files: |
+            release/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
